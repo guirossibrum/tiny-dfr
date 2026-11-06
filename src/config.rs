@@ -69,6 +69,7 @@ where
 #[derive(Deserialize)]
 #[serde(rename_all = "PascalCase")]
 pub struct ButtonConfig {
+    pub trace: Option<crate::trace::TraceConfig>,
     #[serde(alias = "Svg")]
     pub icon: Option<String>,
     pub text: Option<String>,
@@ -114,7 +115,9 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.media_layer_keys = user.media_layer_keys.or(base.media_layer_keys);
         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
         base.active_brightness = user.active_brightness.or(base.active_brightness);
-        base.double_press_switch_layers = user.double_press_switch_layers.or(base.double_press_switch_layers);
+        base.double_press_switch_layers = user
+            .double_press_switch_layers
+            .or(base.double_press_switch_layers);
     };
     let mut media_layer_keys = base.media_layer_keys.unwrap();
     let mut primary_layer_keys = base.primary_layer_keys.unwrap();
@@ -123,6 +126,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
             layer.insert(
                 0,
                 ButtonConfig {
+                    trace: None,
                     icon: None,
                     text: Some("esc".into()),
                     theme: None,
@@ -197,7 +201,13 @@ impl ConfigManager {
         }
     }
     #[cold]
-    fn handle_events(&mut self, cfg: &mut Config, layers: &mut [FunctionLayer; 2], width: u16, evts: Result<Vec<InotifyEvent>, Errno>) -> bool {
+    fn handle_events(
+        &mut self,
+        cfg: &mut Config,
+        layers: &mut [FunctionLayer; 2],
+        width: u16,
+        evts: Result<Vec<InotifyEvent>, Errno>,
+    ) -> bool {
         let mut ret = false;
         for evt in evts.unwrap() {
             if Some(evt.wd) != self.watch_desc {

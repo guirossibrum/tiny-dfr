@@ -46,6 +46,7 @@ mod config;
 mod display;
 mod fonts;
 mod pixel_shift;
+mod trace;
 
 use crate::config::ConfigManager;
 use backlight::BacklightManager;
@@ -92,6 +93,7 @@ enum ButtonImage {
     Text(String),
     Svg(Handle),
     Bitmap(ImageSurface),
+    Trace(trace::Trace),
     Time(Vec<ChronoItem<'static>>, Locale),
     Battery(String, BatteryIconMode, BatteryImages),
     Spacer,
@@ -250,6 +252,21 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
 
 impl Button {
     fn with_config(cfg: ButtonConfig) -> Button {
+        if let Some(trace_config) = cfg.trace {
+            match trace::Trace::new(trace_config) {
+                Ok(trace) => {
+                    return Button {
+                        image: ButtonImage::Trace(trace),
+                        changed: true,
+                        active: false,
+                        action: cfg.action,
+                        icon_width: cfg.icon_width.unwrap_or(DEFAULT_ICON_SIZE) as f64,
+                        icon_height: cfg.icon_height.unwrap_or(DEFAULT_ICON_SIZE) as f64,
+                    }
+                }
+                Err(error) => eprintln!("Invalid Trace animation, using static button: {error}"),
+            }
+        }
         if let Some(text) = cfg.text {
             Button::new_text(text, cfg.action)
         } else if let Some(icon) = cfg.icon {
@@ -328,15 +345,25 @@ impl Button {
         let mut plain = Vec::new();
         let mut charging = Vec::new();
         for icon in [
-            "battery_0_bar", "battery_1_bar", "battery_2_bar", "battery_3_bar",
-            "battery_4_bar", "battery_5_bar", "battery_6_bar", "battery_full",
+            "battery_0_bar",
+            "battery_1_bar",
+            "battery_2_bar",
+            "battery_3_bar",
+            "battery_4_bar",
+            "battery_5_bar",
+            "battery_6_bar",
+            "battery_full",
         ] {
             plain.push(Self::load_battery_image(icon, theme.as_ref()));
         }
         for icon in [
-            "battery_charging_20", "battery_charging_30", "battery_charging_50",
-            "battery_charging_60", "battery_charging_80",
-            "battery_charging_90", "battery_charging_full",
+            "battery_charging_20",
+            "battery_charging_30",
+            "battery_charging_50",
+            "battery_charging_60",
+            "battery_charging_80",
+            "battery_charging_90",
+            "battery_charging_full",
         ] {
             charging.push(Self::load_battery_image(icon, theme.as_ref()));
         }
@@ -428,6 +455,12 @@ impl Button {
 
                 svg.render_document(c, &Rectangle::new(x, y, self.icon_width, self.icon_height))
                     .unwrap();
+            }
+            ButtonImage::Trace(trace) => {
+                let x =
+                    button_left_edge + (button_width as f64 / 2.0 - self.icon_width / 2.0).round();
+                let y = y_shift + ((height as f64 - self.icon_height) / 2.0).round();
+                trace.render(c, x, y, self.icon_width, self.icon_height);
             }
             ButtonImage::Bitmap(surf) => {
                 let x =
@@ -544,6 +577,7 @@ pub struct FunctionLayer {
     buttons: Vec<(usize, Button)>,
     virtual_button_count: usize,
     faster_refresh: bool,
+    animated: bool,
 }
 
 impl FunctionLayer {
@@ -569,12 +603,16 @@ impl FunctionLayer {
             })
             .collect::<Vec<_>>();
         let faster_refresh = buttons.iter().any(|(_, b)| b.needs_faster_refresh());
+        let animated = buttons
+            .iter()
+            .any(|(_, b)| matches!(b.image, ButtonImage::Trace(_)));
         FunctionLayer {
             displays_time,
             displays_battery,
             buttons,
             virtual_button_count,
             faster_refresh,
+            animated,
         }
     }
     fn draw(
@@ -812,6 +850,10 @@ where
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--capabilities") {
+        println!("trace-animation ttfx-wipe");
+        return;
+    }
     let mut drm = DrmBackend::open_card().unwrap();
     let (height, width) = drm.mode().size();
     let _ = panic::catch_unwind(AssertUnwindSafe(|| real_main(&mut drm)));
@@ -914,6 +956,8 @@ fn real_main(drm: &mut DrmBackend) {
     } else {
         Local::now().minute()
     };
+    let mut last_animation_frame = Instant::now();
+    const ANIMATION_FRAME: Duration = Duration::from_millis(67); // at most 15 fps
     loop {
         if cfg_mgr.update_config(&mut cfg, &mut layers, width) {
             touches = HashMap::<u32, (usize, usize)>::new();
@@ -928,6 +972,22 @@ fn real_main(drm: &mut DrmBackend) {
             ((60 - now.second()) * 1000) as i32
         };
         let mut next_timeout_ms = min(ms_left, TIMEOUT_MS);
+
+        // Only wake for an animation on the visible, lit layer. Input events
+        // retain their normal epoll wakeups; idle and lid handling are unchanged.
+        if layers[active_layer].animated && backlight.current_bl() > 1 {
+            let elapsed = last_animation_frame.elapsed();
+            if elapsed >= ANIMATION_FRAME {
+                for (_, button) in &mut layers[active_layer].buttons {
+                    if matches!(button.image, ButtonImage::Trace(_)) {
+                        button.changed = true;
+                    }
+                }
+                last_animation_frame = Instant::now();
+            }
+            let remaining = ANIMATION_FRAME.saturating_sub(last_animation_frame.elapsed());
+            next_timeout_ms = min(next_timeout_ms, remaining.as_millis().max(1) as i32);
+        }
 
         if cfg.enable_pixel_shift {
             let (pixel_shift_needs_redraw, pixel_shift_next_timeout_ms) = pixel_shift.update();
@@ -997,8 +1057,12 @@ fn real_main(drm: &mut DrmBackend) {
                 }
                 Event::Keyboard(KeyboardEvent::Key(key)) => {
                     if key.key() == Key::Fn as u32 {
-                        if cfg.double_press_switch_layers > 0 && key.key_state() == KeyState::Pressed {
-                            if last.elapsed() < Duration::from_millis(cfg.double_press_switch_layers.into()) {
+                        if cfg.double_press_switch_layers > 0
+                            && key.key_state() == KeyState::Pressed
+                        {
+                            if last.elapsed()
+                                < Duration::from_millis(cfg.double_press_switch_layers.into())
+                            {
                                 layers.swap(0, 1);
                             }
                             last = Instant::now();

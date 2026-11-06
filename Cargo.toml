@@ -10,6 +10,8 @@ repository = "https://github.com/AsahiLinux/tiny-dfr.git"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+# The same effect engine used by Omarchy screensaver, pinned for reproducibility.
+ttfx = { git = "https://github.com/omacom/ttfx.git", rev = "14ed2742596f0056b13e25d14a83ea851adc2294" }
 cairo-rs = { version = "0.22", default-features = false, features = ["freetype", "png"] }
 librsvg-rebind = "0.3"
 drm = "0.14"

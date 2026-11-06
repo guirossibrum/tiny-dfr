@@ -17,11 +17,14 @@ use ttfx::{
     },
 };
 
+#[path = "trace_graph.rs"]
+mod graph;
+
 const SAMPLES: usize = 128;
 
 /// Run the real ttfx Wipe effect once against a one-row canvas. Only its
 /// coverage masks survive: no terminal output, threads, or engine per frame.
-fn wipe_frames() -> Result<Vec<[bool; SAMPLES]>> {
+fn wipe_frames() -> Result<Vec<f64>> {
     let terminal = TerminalConfig {
         canvas_width: SAMPLES as i64,
         canvas_height: 1,
@@ -37,28 +40,26 @@ fn wipe_frames() -> Result<Vec<[bool; SAMPLES]>> {
     let mut effect = Wipe::new(WipeConfig {
         wipe_direction: CharacterGroup::ColumnLeftToRight,
         wipe_delay: 0,
-        wipe_ease: Easing::InOutCirc,
+        wipe_ease: Easing::Linear,
         final_gradient_stops: vec![Color::from_hex("ffffff").map_err(anyhow::Error::msg)?],
         final_gradient_steps: vec![1],
         final_gradient_frames: 1,
         final_gradient_direction: GradientDirection::Horizontal,
     });
     effect.build(&mut engine)?;
-    let mut frames = vec![[false; SAMPLES]];
+    let mut frames = vec![0.0];
     while effect.next_frame(&mut engine) {
         let mut frame = [false; SAMPLES];
         for &slot in &engine.input_chars {
             let column = engine.input_coord(slot).column as usize - 1;
             frame[column] = engine.is_visible(slot);
         }
-        frames.push(frame);
+        frames.push(frame.iter().filter(|&&on| on).count() as f64 / SAMPLES as f64);
         engine.clock.advance_frame();
         ensure!(frames.len() < 1024, "ttfx wipe did not finish");
     }
     ensure!(
-        frames
-            .last()
-            .is_some_and(|frame| frame.iter().all(|&on| on)),
+        frames.last().is_some_and(|&coverage| coverage == 1.0),
         "ttfx wipe did not cover the entire path"
     );
     Ok(frames)
@@ -97,20 +98,15 @@ fn pause() -> f64 {
     0.5
 }
 
-struct Segment {
-    from: [f64; 2],
-    to: [f64; 2],
-    offset: f64,
-    length: f64,
-}
-
 pub struct Trace {
     config: TraceConfig,
-    segments: Vec<Segment>,
-    length: f64,
+    graph: graph::Graph,
+    waves: Vec<graph::Wave>,
+    durations: Vec<f64>,
+    period: f64,
+    speed: f64,
     started: Instant,
-    origins: [usize; 64],
-    frames: Vec<[bool; SAMPLES]>,
+    frames: Vec<f64>,
 }
 
 impl Trace {
@@ -150,74 +146,67 @@ impl Trace {
                 "Trace coordinates/colors must be in 0..1"
             );
         }
-        let mut segments = Vec::new();
-        let mut length = 0.0;
-        for path in &config.paths {
-            ensure!(path.len() >= 2, "Trace paths require at least two points");
-            for pair in path.windows(2) {
-                let distance = (pair[1][0] - pair[0][0]).hypot(pair[1][1] - pair[0][1]);
-                if distance > f64::EPSILON {
-                    segments.push(Segment {
-                        from: pair[0],
-                        to: pair[1],
-                        offset: length,
-                        length: distance,
-                    });
-                    length += distance;
-                }
-            }
-        }
-        ensure!(length > 0.0, "Trace paths must have positive length");
+        let graph = graph::Graph::new(&config.paths)?;
         let mut rng = Rng::seeded(seed);
-        let mut origins = [0; 64];
-        for i in 0..origins.len() {
-            loop {
-                let candidate = rng.choice_index(SAMPLES);
-                if (i == 0 || candidate != origins[i - 1])
-                    && (i != origins.len() - 1 || candidate != origins[0])
-                {
-                    origins[i] = candidate;
-                    break;
-                }
-            }
-        }
+        let sources = graph.sources(&mut rng, config.line_width)?;
+        let waves: Vec<_> = sources
+            .into_iter()
+            .map(|source| graph.wave(source))
+            .collect();
+        // One fixed physical speed for every starting point and branch. A pass
+        // finishes when its last front arrives, rather than accelerating short rails.
+        let speed = graph.diameter / config.duration_seconds;
+        let durations: Vec<_> = waves
+            .iter()
+            .map(|wave| wave.reach / speed + config.pause_seconds)
+            .collect();
+        let period = durations.iter().sum();
         let frames = wipe_frames()?;
         Ok(Self {
             config,
-            segments,
-            length,
+            graph,
+            waves,
+            durations,
+            period,
+            speed,
             started: Instant::now(),
-            origins,
             frames,
         })
     }
 
-    // Random offsets use ttfx's own RNG, computed only when loading the icon.
-    fn origin(&self, phase: u64) -> f64 {
-        self.origins[phase as usize % self.origins.len()] as f64 / SAMPLES as f64 * self.length
+    fn phase_at(&self, elapsed: f64) -> (usize, f64) {
+        let mut elapsed = elapsed.rem_euclid(self.period);
+        for (index, &duration) in self.durations.iter().enumerate() {
+            if elapsed < duration {
+                return (index, elapsed);
+            }
+            elapsed -= duration;
+        }
+        (0, 0.0)
     }
 
-    fn stroke_range(&self, c: &Context, start: f64, end: f64) {
-        c.new_path();
-        for segment in &self.segments {
-            let low = start.max(segment.offset);
-            let high = end.min(segment.offset + segment.length);
-            if high <= low {
-                continue;
-            }
-            let point = |distance: f64| {
-                let t = (distance - segment.offset) / segment.length;
-                [
-                    segment.from[0] + (segment.to[0] - segment.from[0]) * t,
-                    segment.from[1] + (segment.to[1] - segment.from[1]) * t,
-                ]
-            };
-            let from = point(low);
-            let to = point(high);
-            c.move_to(from[0], from[1]);
-            c.line_to(to[0], to[1]);
-        }
-        c.stroke().unwrap();
+    fn traveled(&self, phase: usize, elapsed: f64) -> f64 {
+        let reach = self.waves[phase].reach;
+        let progress = (elapsed * self.speed / reach).clamp(0.0, 1.0);
+        // Interpolate the real ttfx Linear Wipe coverage masks so the adapter
+        // has no circular easing or coarse per-sample jumps.
+        let frame = progress * (self.frames.len() - 1) as f64;
+        let low = frame.floor() as usize;
+        let high = (low + 1).min(self.frames.len() - 1);
+        let t = frame - low as f64;
+        (self.frames[low] + (self.frames[high] - self.frames[low]) * t) * reach
+    }
+
+    fn stroke(&self, c: &Context, index: usize, start: f64, end: f64) {
+        let edge = &self.graph.edges[index];
+        let (a, b) = (self.graph.nodes[edge.a], self.graph.nodes[edge.b]);
+        let point = |distance: f64| {
+            let t = distance / edge.length;
+            [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t]
+        };
+        let (a, b) = (point(start), point(end));
+        c.move_to(a[0], a[1]);
+        c.line_to(b[0], b[1]);
     }
 
     pub fn render(&self, c: &Context, x: f64, y: f64, width: f64, height: f64) {
@@ -225,11 +214,10 @@ impl Trace {
     }
 
     pub fn render_at(&self, c: &Context, x: f64, y: f64, width: f64, height: f64, elapsed: f64) {
-        let cycle = self.config.duration_seconds + self.config.pause_seconds;
-        let phase = (elapsed / cycle).floor() as u64;
-        let progress = ((elapsed % cycle) / self.config.duration_seconds).clamp(0.0, 1.0);
-        // Timing and reveal order come from the existing ttfx Wipe effect.
-        let frame = &self.frames[((self.frames.len() - 1) as f64 * progress).round() as usize];
+        let (phase, elapsed) = self.phase_at(elapsed);
+        let wave = &self.waves[phase];
+        let traveled = self.traveled(phase, elapsed);
+        let complete = traveled >= wave.reach - 1e-9;
         let (base, fill) = if phase % 2 == 0 {
             (self.config.base_color, self.config.color)
         } else {
@@ -243,32 +231,23 @@ impl Trace {
         c.set_line_width(self.config.line_width);
         c.set_line_cap(LineCap::Square);
         c.set_line_join(LineJoin::Miter);
-        let background = if progress >= 1.0 - 1e-9 { fill } else { base };
+        let background = if complete { fill } else { base };
         c.set_source_rgb(background[0], background[1], background[2]);
-        self.stroke_range(c, 0.0, self.length);
-        c.set_source_rgb(fill[0], fill[1], fill[2]);
-        if progress > 1e-9 && progress < 1.0 - 1e-9 {
-            let origin = self.origin(phase);
-            // Merge adjacent samples before stroking; only the adapter maps
-            // ttfx's one-row coverage onto the configured vector path.
-            let mut first = 0;
-            while first < SAMPLES {
-                if !frame[first] {
-                    first += 1;
-                    continue;
+        c.new_path();
+        for (index, edge) in self.graph.edges.iter().enumerate() {
+            self.stroke(c, index, 0.0, edge.length);
+        }
+        c.stroke().unwrap();
+        if !complete && traveled > 0.0 {
+            c.set_source_rgb(fill[0], fill[1], fill[2]);
+            c.new_path();
+            for index in 0..self.graph.edges.len() {
+                let (spans, count) = self.graph.spans(wave, index, traveled);
+                for &(start, end) in &spans[..count] {
+                    self.stroke(c, index, start, end);
                 }
-                let mut last = first + 1;
-                while last < SAMPLES && frame[last] {
-                    last += 1;
-                }
-                let start = (origin + first as f64 / SAMPLES as f64 * self.length) % self.length;
-                let end = start + (last - first) as f64 / SAMPLES as f64 * self.length;
-                self.stroke_range(c, start, end.min(self.length));
-                if end > self.length {
-                    self.stroke_range(c, 0.0, end - self.length);
-                }
-                first = last;
             }
+            c.stroke().unwrap();
         }
         c.restore().unwrap();
     }
@@ -301,17 +280,36 @@ mod tests {
     #[test]
     fn colors_reverse_without_a_flash_at_phase_boundaries() {
         let trace = Trace::with_seed(config(), 42).unwrap();
-        assert!(pixels(&trace, 3.2) == pixels(&trace, 3.7));
-        assert!(pixels(&trace, 6.9) == pixels(&trace, 7.4));
-        assert_ne!(pixels(&trace, 0.0), pixels(&trace, 1.6));
-        assert_ne!(pixels(&trace, 1.6), pixels(&trace, 3.2));
+        let first = trace.durations[0];
+        let second = first + trace.durations[1];
+        assert!(pixels(&trace, first - 0.1) == pixels(&trace, first));
+        assert!(pixels(&trace, second - 0.1) == pixels(&trace, second));
+        assert!(pixels(&trace, 0.0) != pixels(&trace, first / 2.0));
     }
     #[test]
-    fn origins_change_and_stay_on_the_path() {
+    fn linear_front_speed_does_not_accelerate() {
         let trace = Trace::with_seed(config(), 42).unwrap();
-        for phase in 0..100 {
-            assert!((0.0..trace.length).contains(&trace.origin(phase)));
-            assert_ne!(trace.origin(phase), trace.origin(phase + 1));
+        for phase in 0..trace.waves.len() {
+            let travel_time = trace.waves[phase].reach / trace.speed;
+            for step in 1..10 {
+                let elapsed = travel_time * step as f64 / 10.0;
+                let actual = trace.traveled(phase, elapsed);
+                let expected = elapsed * trace.speed;
+                assert!((actual - expected).abs() < trace.waves[phase].reach * 0.02);
+            }
+        }
+    }
+    #[test]
+    fn origins_change_and_stay_strictly_inside_rails() {
+        let trace = Trace::with_seed(config(), 42).unwrap();
+        for (i, wave) in trace.waves.iter().enumerate() {
+            let edge = &trace.graph.edges[wave.source.edge];
+            assert!(wave.source.offset >= trace.config.line_width);
+            assert!(edge.length - wave.source.offset >= trace.config.line_width - 1e-9);
+            let next = &trace.waves[(i + 1) % trace.waves.len()];
+            assert!(
+                wave.source.edge != next.source.edge || wave.source.offset != next.source.offset
+            );
         }
     }
     #[test]

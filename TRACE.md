@@ -8,23 +8,37 @@ The button's action and Fn behavior do not change.
 { Icon = "omarchy-green", Action = "Search", Trace = { Paths = [[[0.1, 0.1], [0.9, 0.1], [0.9, 0.9]]], Color = [0.57, 0.80, 0.33], BaseColor = [0.4, 0.4, 0.4], LineWidth = 0.068, DurationSeconds = 3.2, PauseSeconds = 0.5 } }
 ```
 
-Paths are disconnected polylines in normalized icon coordinates. Width is also
+Paths specify connected rails in normalized icon coordinates. Explicit points
+that lie on another rail split it into a shared node; duplicated/reversed rails
+are deduplicated. Disconnected graphs fall back to the static icon. Width is also
 normalized. There may be at most 64 paths and 1024 points; colors and coordinates
 must be finite and in 0..1. Duration is 0.5..120 seconds; pause is 0..60 seconds.
 Invalid trace settings fall back to the static button with a diagnostic.
 
 The **actual ttfx `fx::effects::wipe::Wipe` implementation** generates coverage
 masks on a 128-cell, one-row virtual canvas when the icon loads. It uses ttfx's
-InOutCirc easing. The full engine is dropped after these masks are generated;
+Linear easing. The full engine is dropped after these masks are generated;
 the per-frame code maps the masks to the vector path and paints with Cairo.
 ttfx is pinned to a full Git revision in Cargo.toml and Cargo.lock. No code is
 copied out of ttfx, and no terminal, subprocess, or animation thread runs.
 
-Each pass alternates gray-to-green and green-to-gray. ttfx's RNG generates 64
-origins when loading; adjacent passes always start at different points, including
-the wrap from the last stored origin to the first. The origin sequence repeats
-after 64 passes. The effect stays on its current layer and does not reload config
-or reset held keys.
+Each pass alternates gray-to-green and green-to-gray. ttfx's RNG chooses 64
+interior sources on eligible rails. Each source is at least `LineWidth` away from
+both endpoint nodes, so it never starts on a node. Adjacent sources differ,
+including across the 64-pass repeat boundary.
+
+The renderer computes weighted shortest arrival distances from each source to
+every graph node at load time. A source inside a rail launches two fronts. When
+a front reaches a degree-3 junction it splits into two outgoing rails; a degree-4
+junction splits into three. Fronts merge inside rails reached from both ends.
+The last-arrival distance includes rail interiors, preventing leftover gaps on
+loops. Per-frame work uses fixed-size, merged spans with no route search.
+
+`DurationSeconds` is the time to traverse the graph's node-to-node diameter.
+Travel speed is fixed across sources; pass duration varies with the last arrival,
+then holds for `PauseSeconds`. The real ttfx Linear Wipe curve is interpolated
+between its samples to avoid the former circular easing acceleration. A pass
+does not reset its layer, reload configuration, or reset held keys.
 
 Animation is capped at roughly 15 fps. Only animated buttons are marked dirty.
 No animation wakeups occur on a static/Fn layer or while the backlight is dimmed

@@ -20,6 +20,7 @@ pub struct Config {
     pub show_button_outlines: bool,
     pub enable_pixel_shift: bool,
     pub font_face: FontFace,
+    pub font_sync_uid: Option<u32>,
     pub adaptive_brightness: bool,
     pub active_brightness: u32,
     pub double_press_switch_layers: u32,
@@ -32,6 +33,7 @@ struct ConfigProxy {
     show_button_outlines: Option<bool>,
     enable_pixel_shift: Option<bool>,
     font_template: Option<String>,
+    font_sync_uid: Option<u32>,
     adaptive_brightness: Option<bool>,
     active_brightness: Option<u32>,
     double_press_switch_layers: Option<u32>,
@@ -87,19 +89,20 @@ pub struct ButtonConfig {
     pub icon_height: Option<i32>,
 }
 
-fn load_font(name: &str) -> FontFace {
+pub(crate) fn try_load_font(name: &str) -> Result<FontFace, String> {
     let fontconfig = FontConfig::new();
-    let mut pattern = Pattern::new(name);
+    let mut pattern = Pattern::try_new(name).map_err(|_| "Invalid font family".to_owned())?;
     fontconfig.perform_substitutions(&mut pattern);
-    let pat_match = match fontconfig.match_pattern(&pattern) {
-        Ok(pat) => pat,
-        Err(_) => panic!("Unable to find specified font. If you are using the default config, make sure you have at least one font installed")
-    };
+    let pat_match = fontconfig
+        .match_pattern(&pattern)
+        .map_err(|_| "No matching font".to_owned())?;
     let file_name = pat_match.get_file_name();
     let file_idx = pat_match.get_font_index();
-    let ft_library = FtLibrary::init().unwrap();
-    let face = ft_library.new_face(file_name, file_idx).unwrap();
-    FontFace::create_from_ft(&face).unwrap()
+    let ft_library = FtLibrary::init().map_err(|error| error.to_string())?;
+    let face = ft_library
+        .new_face(file_name, file_idx)
+        .map_err(|error| error.to_string())?;
+    FontFace::create_from_ft(&face).map_err(|error| error.to_string())
 }
 
 fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
@@ -114,6 +117,7 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         base.show_button_outlines = user.show_button_outlines.or(base.show_button_outlines);
         base.enable_pixel_shift = user.enable_pixel_shift.or(base.enable_pixel_shift);
         base.font_template = user.font_template.or(base.font_template);
+        base.font_sync_uid = user.font_sync_uid.or(base.font_sync_uid);
         base.adaptive_brightness = user.adaptive_brightness.or(base.adaptive_brightness);
         base.media_layer_keys = user.media_layer_keys.or(base.media_layer_keys);
         base.primary_layer_keys = user.primary_layer_keys.or(base.primary_layer_keys);
@@ -157,7 +161,9 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         show_button_outlines: base.show_button_outlines.unwrap(),
         enable_pixel_shift: base.enable_pixel_shift.unwrap(),
         adaptive_brightness: base.adaptive_brightness.unwrap(),
-        font_face: load_font(&base.font_template.unwrap()),
+        font_face: try_load_font(&base.font_template.unwrap())
+            .expect("Unable to load configured font"),
+        font_sync_uid: base.font_sync_uid,
         active_brightness: base.active_brightness.unwrap(),
         // Older packaged templates do not include this optional newer setting.
         double_press_switch_layers: base.double_press_switch_layers.unwrap_or(0),

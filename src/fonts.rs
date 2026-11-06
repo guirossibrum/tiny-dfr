@@ -21,6 +21,7 @@ const FcResultOutOfMemory: FcResult = 4;
 type FcMatchKind = c_int;
 const FcMatchPattern: FcMatchKind = 0;
 
+#[derive(Debug)]
 pub enum FontConfigError {
     FontNotFound,
 }
@@ -84,10 +85,13 @@ pub struct Pattern {
 }
 
 impl Pattern {
-    pub fn new(st: &str) -> Pattern {
-        let cstr = CString::new(st).unwrap();
+    pub fn try_new(st: &str) -> Result<Pattern, FontConfigError> {
+        let cstr = CString::new(st).map_err(|_| FontConfigError::FontNotFound)?;
         let pattern = unsafe { FcNameParse(cstr.as_ptr()) };
-        Pattern { pattern }
+        if pattern.is_null() {
+            return Err(FontConfigError::FontNotFound);
+        }
+        Ok(Pattern { pattern })
     }
     pub fn get_file_name(&self) -> &str {
         let name = CString::new("file").unwrap();

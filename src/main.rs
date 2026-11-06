@@ -44,6 +44,7 @@ use udev::MonitorBuilder;
 mod backlight;
 mod config;
 mod display;
+mod font_sync;
 mod fonts;
 mod pixel_shift;
 mod press_hold;
@@ -960,6 +961,15 @@ fn real_main(drm: &mut DrmBackend) {
     let mut backlight = BacklightManager::new();
     let mut cfg_mgr = ConfigManager::new();
     let (mut cfg, mut layers) = cfg_mgr.load_config(width);
+    let mut font_sync = cfg
+        .font_sync_uid
+        .and_then(|uid| match font_sync::FontSync::new(uid) {
+            Ok(sync) => Some(sync),
+            Err(error) => {
+                eprintln!("Font sync unavailable: {error}");
+                None
+            }
+        });
     let mut pixel_shift = PixelShiftManager::new();
     let mut last = Instant::now();
 
@@ -971,6 +981,10 @@ fn real_main(drm: &mut DrmBackend) {
         .group_list(&groups)
         .apply()
         .unwrap_or_else(|e| panic!("Failed to drop privileges: {}", e));
+
+    if let Some(sync) = &mut font_sync {
+        sync.update(&mut cfg, true);
+    }
 
     let mut surface =
         ImageSurface::create(Format::ARgb32, db_width as i32, db_height as i32).unwrap();
@@ -1003,6 +1017,11 @@ fn real_main(drm: &mut DrmBackend) {
     uinput.set_evbit(EventKind::Key).unwrap();
     for k in Key::iter() {
         uinput.set_keybit(k).unwrap();
+    }
+    if let Some(sync) = &font_sync {
+        epoll
+            .add(sync.fd(), EpollEvent::new(EpollFlags::EPOLLIN, 4))
+            .unwrap();
     }
     let mut dev_name_c = [0 as c_char; 80];
     let dev_name = "Dynamic Function Row Virtual Input Device".as_bytes();
@@ -1045,6 +1064,11 @@ fn real_main(drm: &mut DrmBackend) {
             needs_complete_redraw = true;
         }
 
+        if let Some(sync) = &mut font_sync {
+            if sync.update(&mut cfg, false) {
+                needs_complete_redraw = true;
+            }
+        }
         if backlight.current_bl() == 0 {
             for (_, mut touch) in touches.drain() {
                 touch.finish(&mut uinput, true);

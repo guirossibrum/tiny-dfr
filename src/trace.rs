@@ -95,7 +95,7 @@ fn duration() -> f64 {
     3.2
 }
 fn pause() -> f64 {
-    0.5
+    1.0
 }
 
 pub struct Trace {
@@ -158,7 +158,15 @@ impl Trace {
         let speed = graph.diameter / config.duration_seconds;
         let durations: Vec<_> = waves
             .iter()
-            .map(|wave| wave.reach / speed + config.pause_seconds)
+            .enumerate()
+            .map(|(phase, wave)| {
+                wave.reach / speed
+                    + if phase % 2 == 0 {
+                        config.pause_seconds
+                    } else {
+                        0.0
+                    }
+            })
             .collect();
         let period = durations.iter().sum();
         let frames = wipe_frames()?;
@@ -283,8 +291,24 @@ mod tests {
         let first = trace.durations[0];
         let second = first + trace.durations[1];
         assert!(pixels(&trace, first - 0.1) == pixels(&trace, first));
-        assert!(pixels(&trace, second - 0.1) == pixels(&trace, second));
+        assert!(pixels(&trace, second) == pixels(&trace, 0.0));
         assert!(pixels(&trace, 0.0) != pixels(&trace, first / 2.0));
+    }
+    #[test]
+    fn holds_green_for_one_second_and_recolors_gray_immediately() {
+        let trace = Trace::with_seed(config(), 42).unwrap();
+        let green_finished = trace.waves[0].reach / trace.speed;
+        assert!((trace.durations[0] - green_finished - 1.0).abs() < 1e-9);
+        assert!(pixels(&trace, green_finished) == pixels(&trace, green_finished + 0.9));
+        let gray_started = trace.durations[0];
+        let gray_finished = gray_started + trace.durations[1];
+        assert!((trace.durations[1] - trace.waves[1].reach / trace.speed).abs() < 1e-9);
+        assert!(pixels(&trace, gray_finished) != pixels(&trace, gray_finished + 0.2));
+        for (phase, wave) in trace.waves.iter().enumerate() {
+            let hold = trace.durations[phase] - wave.reach / trace.speed;
+            let expected = if phase % 2 == 0 { 1.0 } else { 0.0 };
+            assert!((hold - expected).abs() < 1e-9);
+        }
     }
     #[test]
     fn linear_front_speed_does_not_accelerate() {

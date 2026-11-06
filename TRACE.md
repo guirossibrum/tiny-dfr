@@ -5,7 +5,7 @@ static fallback: unmodified tiny-dfr ignores the new field and shows that icon.
 The button's action and Fn behavior do not change.
 
 ```toml
-{ Icon = "omarchy-green", Action = "Search", Trace = { Paths = [[[0.1, 0.1], [0.9, 0.1], [0.9, 0.9]]], Color = [0.57, 0.80, 0.33], BaseColor = [0.4, 0.4, 0.4], LineWidth = 0.068, DurationSeconds = 3.2, PauseSeconds = 0.5 } }
+{ Icon = "omarchy-green", Action = "Search", Trace = { Paths = [[[0.1, 0.1], [0.9, 0.1], [0.9, 0.9]]], Color = [0.57, 0.80, 0.33], BaseColor = [0.4, 0.4, 0.4], LineWidth = 0.068, DurationSeconds = 3.2, PauseSeconds = 1.0 } }
 ```
 
 Paths specify connected rails in normalized icon coordinates. Explicit points
@@ -36,13 +36,15 @@ loops. Per-frame work uses fixed-size, merged spans with no route search.
 
 `DurationSeconds` is the time to traverse the graph's node-to-node diameter.
 Travel speed is fixed across sources; pass duration varies with the last arrival,
-then holds for `PauseSeconds`. The real ttfx Linear Wipe curve is interpolated
+then holds for `PauseSeconds` only when fully green (default one second).
+There is no hold when fully gray: the next green-fill pass begins immediately. The real ttfx Linear Wipe curve is interpolated
 between its samples to avoid the former circular easing acceleration. A pass
 does not reset its layer, reload configuration, or reset held keys.
 
 Animation is capped at roughly 15 fps. Only animated buttons are marked dirty.
-No animation wakeups occur on a static/Fn layer or while the backlight is dimmed
-or off. Existing input, lid handling, adaptive brightness and idle timers remain
+Animation continues while the backlight is idle-dimmed (brightness 1).
+No animation wakeups occur on a static/Fn layer or while the backlight is fully
+off (brightness 0). Existing input, lid handling, adaptive brightness and idle timers remain
 with tiny-dfr. Resource use must be measured on the target hardware rather than
 inferred from the implementation alone.
 

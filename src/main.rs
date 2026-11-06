@@ -978,9 +978,10 @@ fn real_main(drm: &mut DrmBackend) {
         };
         let mut next_timeout_ms = min(ms_left, TIMEOUT_MS);
 
-        // Only wake for an animation on the visible, lit layer. Input events
+        // Animate the visible layer even at idle-dim brightness (1). A fully
+        // off backlight (0) still sleeps. Input events
         // retain their normal epoll wakeups; idle and lid handling are unchanged.
-        if layers[active_layer].animated && backlight.current_bl() > 1 {
+        if layers[active_layer].animated && backlight.current_bl() > 0 {
             let elapsed = last_animation_frame.elapsed();
             if elapsed >= ANIMATION_FRAME {
                 for (_, button) in &mut layers[active_layer].buttons {

@@ -850,6 +850,11 @@ where
 }
 
 fn main() {
+    if std::env::args().nth(1).as_deref() == Some("--check-config") {
+        let _ = ConfigManager::new().load_config(2008);
+        println!("Configuration OK");
+        return;
+    }
     if std::env::args().nth(1).as_deref() == Some("--capabilities") {
         println!("trace-animation ttfx-wipe");
         return;

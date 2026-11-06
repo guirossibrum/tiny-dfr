@@ -154,7 +154,8 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
         adaptive_brightness: base.adaptive_brightness.unwrap(),
         font_face: load_font(&base.font_template.unwrap()),
         active_brightness: base.active_brightness.unwrap(),
-        double_press_switch_layers: base.double_press_switch_layers.unwrap(),
+        // Older packaged templates do not include this optional newer setting.
+        double_press_switch_layers: base.double_press_switch_layers.unwrap_or(0),
     };
     (cfg, layers)
 }

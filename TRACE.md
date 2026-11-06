@@ -42,9 +42,15 @@ and rollback instructions. The daemon has no hard-coded Omarchy shape.
 cargo test --locked
 cargo build --locked --release --bin tiny-dfr
 target/release/tiny-dfr --capabilities
+target/release/tiny-dfr --check-config
 cargo run --locked --bin trace-preview -- /path/to/plugin/native/preview.toml /tmp/trace-frames
 ```
 
 The preview uses the same Rust/Cairo renderer without opening DRM or requiring
 root. Tests cover phase-boundary continuity, intermediate frames, changing origins,
 bounded configuration, and completion of the real ttfx Wipe effect.
+
+`--check-config` loads the installed templates, user overrides, fonts and icons
+without opening DRM. Templates predating `DoublePressSwitchLayers` default that
+optional setting to zero. The companion installer validates config before
+activation and restores the packaged daemon if the new invocation reports a panic.

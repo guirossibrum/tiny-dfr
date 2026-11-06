@@ -70,3 +70,18 @@ bounded configuration, and completion of the real ttfx Wipe effect.
 without opening DRM. Templates predating `DoublePressSwitchLayers` default that
 optional setting to zero. The companion installer validates config before
 activation and restores the packaged daemon if the new invocation reports a panic.
+
+## Text alignment and optional holds
+
+Text buttons use one font-metrics baseline, including labels with descenders,
+and subtract the horizontal ink bearing when centering. The companion plugin
+resolves the current user's Omarchy monospace font before writing `FontTemplate`.
+
+An optional `HoldAction = "F15", HoldMilliseconds = 600` on a button defers its
+normal action until a short tap releases. Crossing the threshold presses the
+hold action exactly once; release lifts it without triggering the tap. The
+threshold is 200..2000 ms. Sliding off, input cancellation, device removal,
+layer changes, config reload, and a fully off backlight release/cancel holds.
+Only virtual keycodes are emitted; the daemon never launches dictation commands.
+The user-session plugin binds F15 press/release through Omarchy's backend-neutral
+`omarchy dictation start` / `omarchy dictation stop` commands.

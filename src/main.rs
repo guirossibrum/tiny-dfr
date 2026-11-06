@@ -46,6 +46,8 @@ mod config;
 mod display;
 mod fonts;
 mod pixel_shift;
+mod press_hold;
+mod text_layout;
 mod trace;
 
 use crate::config::ConfigManager;
@@ -104,6 +106,8 @@ struct Button {
     changed: bool,
     active: bool,
     action: Vec<Key>,
+    hold_action: Vec<Key>,
+    hold_delay: Duration,
     icon_width: f64,
     icon_height: f64,
 }
@@ -252,10 +256,21 @@ fn get_battery_state(battery: &str) -> (u32, BatteryState) {
 
 impl Button {
     fn with_config(cfg: ButtonConfig) -> Button {
+        let hold_action = cfg.hold_action.clone();
+        let hold_delay =
+            Duration::from_millis(cfg.hold_milliseconds.unwrap_or(600).clamp(200, 2000));
+        let mut button = Self::from_config(cfg);
+        button.hold_action = hold_action;
+        button.hold_delay = hold_delay;
+        button
+    }
+    fn from_config(cfg: ButtonConfig) -> Button {
         if let Some(trace_config) = cfg.trace {
             match trace::Trace::new(trace_config) {
                 Ok(trace) => {
                     return Button {
+                        hold_action: vec![],
+                        hold_delay: Duration::from_millis(600),
                         image: ButtonImage::Trace(trace),
                         changed: true,
                         active: false,
@@ -291,6 +306,8 @@ impl Button {
     }
     fn new_spacer() -> Button {
         Button {
+            hold_action: vec![],
+            hold_delay: Duration::from_millis(600),
             action: vec![],
             active: false,
             changed: false,
@@ -301,6 +318,8 @@ impl Button {
     }
     fn new_text(text: String, action: Vec<Key>) -> Button {
         Button {
+            hold_action: vec![],
+            hold_delay: Duration::from_millis(600),
             action,
             active: false,
             changed: false,
@@ -319,6 +338,8 @@ impl Button {
         let image =
             try_load_image(path, theme, icon_width, icon_height).expect("failed to load icon");
         Button {
+            hold_action: vec![],
+            hold_delay: Duration::from_millis(600),
             action,
             image,
             icon_width: icon_width as f64,
@@ -374,6 +395,8 @@ impl Button {
             _ => panic!("invalid battery mode, accepted modes: icon, percentage, both"),
         };
         Button {
+            hold_action: vec![],
+            hold_delay: Duration::from_millis(600),
             action,
             active: false,
             changed: false,
@@ -409,6 +432,8 @@ impl Button {
             .and_then(|l| Locale::try_from(l).ok())
             .unwrap_or(Locale::POSIX);
         Button {
+            hold_action: vec![],
+            hold_delay: Duration::from_millis(600),
             action,
             active: false,
             changed: false,
@@ -441,11 +466,15 @@ impl Button {
     ) {
         match &self.image {
             ButtonImage::Text(text) => {
-                let extents = c.text_extents(text).unwrap();
-                c.move_to(
-                    button_left_edge + (button_width as f64 / 2.0 - extents.width() / 2.0).round(),
-                    y_shift + (height as f64 / 2.0 + extents.height() / 2.0).round(),
+                let (x, y) = text_layout::origin(
+                    c,
+                    text,
+                    height as f64,
+                    button_left_edge,
+                    button_width as f64,
+                    y_shift,
                 );
+                c.move_to(x, y);
                 c.show_text(text).unwrap();
             }
             ButtonImage::Svg(svg) => {
@@ -553,7 +582,9 @@ impl Button {
             self.active = active;
             self.changed = true;
 
-            toggle_keys(uinput, &self.action, active as i32);
+            if self.hold_action.is_empty() {
+                toggle_keys(uinput, &self.action, active as i32);
+            }
         }
     }
     fn set_background_color(&self, c: &Context, color: f64) {
@@ -849,6 +880,44 @@ where
     );
 }
 
+struct TouchState {
+    layer: usize,
+    button: usize,
+    tap_action: Vec<Key>,
+    hold_action: Vec<Key>,
+    gesture: Option<press_hold::Gesture>,
+}
+
+impl TouchState {
+    fn emit<F: AsRawFd>(&self, uinput: &mut UInputHandle<F>, action: press_hold::Action) {
+        match action {
+            press_hold::Action::Tap => {
+                toggle_keys(uinput, &self.tap_action, 1);
+                toggle_keys(uinput, &self.tap_action, 0);
+            }
+            press_hold::Action::Start => toggle_keys(uinput, &self.hold_action, 1),
+            press_hold::Action::Stop => toggle_keys(uinput, &self.hold_action, 0),
+            press_hold::Action::None => {}
+        }
+    }
+    fn tick<F: AsRawFd>(&mut self, uinput: &mut UInputHandle<F>) {
+        if let Some(gesture) = &mut self.gesture {
+            let action = gesture.tick(Instant::now());
+            self.emit(uinput, action);
+        }
+    }
+    fn finish<F: AsRawFd>(&mut self, uinput: &mut UInputHandle<F>, cancel: bool) {
+        if let Some(gesture) = &mut self.gesture {
+            let action = if cancel {
+                gesture.cancel()
+            } else {
+                gesture.release()
+            };
+            self.emit(uinput, action);
+        }
+    }
+}
+
 fn main() {
     if std::env::args().nth(1).as_deref() == Some("--check-config") {
         let _ = ConfigManager::new().load_config(2008);
@@ -955,7 +1024,7 @@ fn real_main(drm: &mut DrmBackend) {
     uinput.dev_create().unwrap();
 
     let mut digitizer: Option<InputDevice> = None;
-    let mut touches = HashMap::<u32, (usize, usize)>::new();
+    let mut touches = HashMap::<u32, TouchState>::new();
     let mut last_redraw_ts = if layers[active_layer].faster_refresh {
         Local::now().second()
     } else {
@@ -965,9 +1034,24 @@ fn real_main(drm: &mut DrmBackend) {
     const ANIMATION_FRAME: Duration = Duration::from_millis(67); // at most 15 fps
     loop {
         if cfg_mgr.update_config(&mut cfg, &mut layers, width) {
-            touches = HashMap::<u32, (usize, usize)>::new();
+            for touch in touches.values_mut() {
+                touch.finish(&mut uinput, true);
+                if touch.gesture.is_none() {
+                    toggle_keys(&mut uinput, &touch.tap_action, 0);
+                }
+            }
+            touches.clear();
             active_layer = 0;
             needs_complete_redraw = true;
+        }
+
+        if backlight.current_bl() == 0 {
+            for (_, mut touch) in touches.drain() {
+                touch.finish(&mut uinput, true);
+                layers[touch.layer].buttons[touch.button]
+                    .1
+                    .set_active(&mut uinput, false);
+            }
         }
 
         let now = Local::now();
@@ -977,6 +1061,16 @@ fn real_main(drm: &mut DrmBackend) {
             ((60 - now.second()) * 1000) as i32
         };
         let mut next_timeout_ms = min(ms_left, TIMEOUT_MS);
+        for touch in touches.values_mut() {
+            touch.tick(&mut uinput);
+            if let Some(remaining) = touch
+                .gesture
+                .as_ref()
+                .and_then(|g| g.remaining(Instant::now()))
+            {
+                next_timeout_ms = min(next_timeout_ms, remaining.as_millis().max(1) as i32);
+            }
+        }
 
         // Animate the visible layer even at idle-dim brightness (1). A fully
         // off backlight (0) still sleeps. Input events
@@ -1052,6 +1146,10 @@ fn real_main(drm: &mut DrmBackend) {
 
         input_tb.dispatch().unwrap();
         input_main.dispatch().unwrap();
+        // Process expired holds before handling a release at the same deadline.
+        for touch in touches.values_mut() {
+            touch.tick(&mut uinput);
+        }
         for event in &mut input_tb.clone().chain(input_main.clone()) {
             backlight.process_event(&event);
             match event {
@@ -1059,6 +1157,17 @@ fn real_main(drm: &mut DrmBackend) {
                     let dev = evt.device();
                     if dev.name().contains(" Touch Bar") {
                         digitizer = Some(dev);
+                    }
+                }
+                Event::Device(DeviceEvent::Removed(evt)) => {
+                    if Some(evt.device()) == digitizer {
+                        for (_, mut touch) in touches.drain() {
+                            touch.finish(&mut uinput, true);
+                            layers[touch.layer].buttons[touch.button]
+                                .1
+                                .set_active(&mut uinput, false);
+                        }
+                        digitizer = None;
                     }
                 }
                 Event::Keyboard(KeyboardEvent::Key(key)) => {
@@ -1078,6 +1187,12 @@ fn real_main(drm: &mut DrmBackend) {
                             KeyState::Released => 0,
                         };
                         if active_layer != new_layer {
+                            for (_, mut touch) in touches.drain() {
+                                touch.finish(&mut uinput, true);
+                                layers[touch.layer].buttons[touch.button]
+                                    .1
+                                    .set_active(&mut uinput, false);
+                            }
                             active_layer = new_layer;
                             needs_complete_redraw = true;
                         }
@@ -1092,7 +1207,22 @@ fn real_main(drm: &mut DrmBackend) {
                             let x = dn.x_transformed(width as u32);
                             let y = dn.y_transformed(height as u32);
                             if let Some(btn) = layers[active_layer].hit(width, height, x, y, None) {
-                                touches.insert(dn.seat_slot(), (active_layer, btn));
+                                let button = &layers[active_layer].buttons[btn].1;
+                                touches.insert(
+                                    dn.seat_slot(),
+                                    TouchState {
+                                        layer: active_layer,
+                                        button: btn,
+                                        tap_action: button.action.clone(),
+                                        hold_action: button.hold_action.clone(),
+                                        gesture: (!button.hold_action.is_empty()).then(|| {
+                                            press_hold::Gesture::new(
+                                                Instant::now(),
+                                                button.hold_delay,
+                                            )
+                                        }),
+                                    },
+                                );
                                 layers[active_layer].buttons[btn]
                                     .1
                                     .set_active(&mut uinput, true);
@@ -1105,18 +1235,31 @@ fn real_main(drm: &mut DrmBackend) {
 
                             let x = mtn.x_transformed(width as u32);
                             let y = mtn.y_transformed(height as u32);
-                            let (layer, btn) = *touches.get(&mtn.seat_slot()).unwrap();
-                            let hit = layers[active_layer]
-                                .hit(width, height, x, y, Some(btn))
-                                .is_some();
-                            layers[layer].buttons[btn].1.set_active(&mut uinput, hit);
+                            let touch = touches.get(&mtn.seat_slot()).unwrap();
+                            let (layer, btn) = (touch.layer, touch.button);
+                            let hit = layer == active_layer
+                                && layers[layer].hit(width, height, x, y, Some(btn)).is_some();
+                            if !hit {
+                                let mut touch = touches.remove(&mtn.seat_slot()).unwrap();
+                                touch.finish(&mut uinput, true);
+                                layers[layer].buttons[btn].1.set_active(&mut uinput, false);
+                            }
                         }
                         TouchEvent::Up(up) => {
-                            if !touches.contains_key(&up.seat_slot()) {
-                                continue;
+                            if let Some(mut touch) = touches.remove(&up.seat_slot()) {
+                                touch.finish(&mut uinput, false);
+                                layers[touch.layer].buttons[touch.button]
+                                    .1
+                                    .set_active(&mut uinput, false);
                             }
-                            let (layer, btn) = *touches.get(&up.seat_slot()).unwrap();
-                            layers[layer].buttons[btn].1.set_active(&mut uinput, false);
+                        }
+                        TouchEvent::Cancel(cancel) => {
+                            if let Some(mut touch) = touches.remove(&cancel.seat_slot()) {
+                                touch.finish(&mut uinput, true);
+                                layers[touch.layer].buttons[touch.button]
+                                    .1
+                                    .set_active(&mut uinput, false);
+                            }
                         }
                         _ => {}
                     }

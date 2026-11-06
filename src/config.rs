@@ -70,6 +70,9 @@ where
 #[serde(rename_all = "PascalCase")]
 pub struct ButtonConfig {
     pub trace: Option<crate::trace::TraceConfig>,
+    #[serde(deserialize_with = "array_or_single", default)]
+    pub hold_action: Vec<Key>,
+    pub hold_milliseconds: Option<u64>,
     #[serde(alias = "Svg")]
     pub icon: Option<String>,
     pub text: Option<String>,
@@ -127,6 +130,8 @@ fn load_config(width: u16) -> (Config, [FunctionLayer; 2]) {
                 0,
                 ButtonConfig {
                     trace: None,
+                    hold_action: vec![],
+                    hold_milliseconds: None,
                     icon: None,
                     text: Some("esc".into()),
                     theme: None,
